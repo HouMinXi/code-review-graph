@@ -3296,8 +3296,6 @@ def _create_watch_handler(
                 if files_updated > 0 and on_files_updated is not None:
                     postprocess_result = on_files_updated(store)
                     _raise_watch_postprocess_warnings(postprocess_result)
-                if files_updated > 0 and hasattr(store, "_invalidate_cache"):
-                    store._invalidate_cache()
             except BaseException as exc:
                 self.failure = exc
 
