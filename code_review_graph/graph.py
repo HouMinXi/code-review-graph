@@ -1,6 +1,6 @@
 """SQLite-backed knowledge graph storage and query engine.
 
-Stores code structure as nodes (File, Class, Function, Type, Test) and
+Stores code structure as nodes (File, Class, Function, Type, Test, YamlPath) and
 edges (CALLS, IMPORTS_FROM, INHERITS, IMPLEMENTS, CONTAINS, TESTED_BY, DEPENDS_ON, REFERENCES).
 Supports impact-radius queries and subgraph extraction.
 """
@@ -17,9 +17,12 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-import networkx as nx
+if TYPE_CHECKING:
+    import networkx as nx
+
+    from .parser import EdgeInfo, NodeInfo
 
 from .constants import (
     BFS_ENGINE,
@@ -40,6 +43,9 @@ from .constants import (
     MAX_IMPACT_DEPTH,
     MAX_IMPACT_NODES,
     env_int,
+    normalize_file_path,
+    read_only_requested,
+    release_os_memory,
 )
 from .errors import GraphStoreError, is_lock_error
 from .migrations import (
@@ -50,7 +56,6 @@ from .migrations import (
     run_migrations,
     target_resolution_expr,
 )
-from .parser import EdgeInfo, NodeInfo, is_test_file, normalize_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -440,11 +445,28 @@ GROUP BY dir
 """
 
 
+#: AOP-derived CALLS edges (advice -> target, tagged ``extra.aop_resolved``)
+#: do not follow the plain CALLS impact policy: an advice is not "called by"
+#: the method it wraps, so target -> source propagation would answer "the
+#: target changed, is the aspect impacted" and miss the relationship that
+#: matters -- "the advice changed, what does it impact". These edges always
+#: propagate source -> target regardless of CALLS' registered direction.
+#: See aop_resolver.py's module docstring and PR #916 review.
+_IMPACT_AOP_EXTRA_LIKE = '%"aop_resolved"%'
+_IMPACT_AOP_DIRECTION_CASE = (
+    "CASE WHEN e.extra LIKE ? THEN ? ELSE COALESCE(p.direction, ?) END"
+)
+
+
 def _impact_candidate_sql(resolution_guard: str) -> str:
     """One hop of the impact relaxation.
 
     *resolution_guard* is either the empty string or a fixed predicate chosen
     by a validated enum; no caller value reaches the SQL text.
+
+    The first two branches carry the AOP direction override, so each binds
+    the ``extra`` LIKE pattern and the forced direction ahead of the policy
+    default. See ``_IMPACT_AOP_DIRECTION_CASE``.
 
     The third branch is the directory-scoped one. A Go import names a
     package, so its edge targets the file's DIRECTORY rather than the file,
@@ -467,14 +489,14 @@ def _impact_candidate_sql(resolution_guard: str) -> str:
         FROM _impact_frontier f
         JOIN edges e ON e.source_qualified = f.node_qn
         LEFT JOIN _impact_policies p ON p.kind = e.kind
-        WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
+        WHERE {_IMPACT_AOP_DIRECTION_CASE} = ?{resolution_guard}
         UNION ALL
         SELECT e.source_qualified AS node_qn,
                f.score * COALESCE(p.weight, ?) * ? AS score
         FROM _impact_frontier f
         JOIN edges e ON e.target_qualified = f.node_qn
         LEFT JOIN _impact_policies p ON p.kind = e.kind
-        WHERE COALESCE(p.direction, ?) = ?{resolution_guard}
+        WHERE {_IMPACT_AOP_DIRECTION_CASE} = ?{resolution_guard}
         UNION ALL
         SELECT e.source_qualified AS node_qn,
                d.score * COALESCE(p.weight, ?) * ? AS score
@@ -691,32 +713,76 @@ def discard_corrupt_database(db_path: str | Path) -> bool:
 class GraphStore:
     """SQLite-backed code knowledge graph."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        read_only: bool | None = None,
+    ) -> None:
         self.db_path = Path(db_path)
+        self.read_only = read_only_requested() if read_only is None else read_only
         conn: sqlite3.Connection | None = None
         try:
-            # Inside the try on purpose: an unwritable data directory raises
-            # here, and it is one of the failures this constructor explains.
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(
-                str(self.db_path), timeout=30, check_same_thread=False,
-                isolation_level=None,  # Disable implicit transactions (#135)
-            )
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-            _assert_usable_database(conn, self.db_path)
-            self._conn = conn
-            self._init_schema()
-            # Ensure schema_version is set, then run pending migrations
-            if get_schema_version(self._conn) < 1:
-                # Fresh DB — metadata table just created by _init_schema
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO metadata (key, value) "
-                    "VALUES ('schema_version', '1')"
+            if self.read_only:
+                if not self.db_path.is_file():
+                    raise GraphStoreError(
+                        f"No graph found at {self.db_path}. "
+                        "Run `code-review-graph build` first."
+                    )
+                conn = sqlite3.connect(
+                    self._read_only_uri(),
+                    uri=True,
+                    timeout=30,
+                    check_same_thread=False,
+                    isolation_level=None,
                 )
-                self._conn.commit()
-            run_migrations(self._conn)
+            else:
+                # Inside the try on purpose: an unwritable data directory
+                # raises here, and it is one of the failures this constructor
+                # explains.
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+                conn = sqlite3.connect(
+                    str(self.db_path), timeout=30, check_same_thread=False,
+                    isolation_level=None,  # Disable implicit transactions (#135)
+                )
+            conn.row_factory = sqlite3.Row
+            if not self.read_only:
+                conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA cache_size=-2000")
+            # FILE keeps the impact-radius working tables reclaimable; the
+            # compile-time default is memory on some SQLite builds.
+            conn.execute("PRAGMA temp_store=FILE")
+            _assert_usable_database(conn, self.db_path)
+            if self.read_only and conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'nodes'"
+            ).fetchone() is None:
+                raise GraphStoreError(
+                    f"No graph found at {self.db_path}. "
+                    "Run `code-review-graph build` first."
+                )
+            if self.read_only and get_schema_version(conn) < LATEST_VERSION:
+                # Migrations write, so queries would hit tables and columns
+                # this old graph does not have yet.
+                raise GraphStoreError(
+                    f"The graph at {self.db_path} is schema "
+                    f"v{get_schema_version(conn)}, this build needs "
+                    f"v{LATEST_VERSION}, and a read-only open cannot upgrade it. "
+                    "Run `code-review-graph update` first."
+                )
+            self._conn = conn
+            if not self.read_only:
+                self._init_schema()
+                # Ensure schema_version is set, then run pending migrations
+                if get_schema_version(self._conn) < 1:
+                    # Fresh DB — metadata table just created by _init_schema
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO metadata (key, value) "
+                        "VALUES ('schema_version', '1')"
+                    )
+                    self._conn.commit()
+                run_migrations(self._conn)
         except (sqlite3.Error, OSError, GraphStoreError) as exc:
             # A corrupt file, a foreign SQLite file, or a data directory this
             # process cannot write to used to escape as a raw traceback from
@@ -769,10 +835,30 @@ class GraphStore:
         except (sqlite3.NotSupportedError, TypeError):  # pragma: no cover
             self._conn.create_function("crg_parent_dir", 1, _parent_dir)
         self._nxg_cache: nx.DiGraph | None = None
+        self._bare_endpoint_context_cache: tuple[
+            dict[str, list[tuple[str, str]]],
+            dict[str, str | None],
+            dict[str, set[str]],
+            dict[str, set[str]],
+        ] | None = None
         self._cache_lock = threading.Lock()
+        self._cache_epoch = 0
         # Identifies the read transaction currently open on this connection,
         # so a reader cannot roll back a transaction a writer took from it.
         self._active_read_txn: object | None = None
+
+    def _read_only_uri(self) -> str:
+        """Open SQLite without creating or updating any database sidecar."""
+        sidecars = tuple(
+            self.db_path.with_name(self.db_path.name + suffix)
+            for suffix in ("-wal", "-shm")
+        )
+        # A checkpointed WAL database has no sidecars. ``immutable`` lets
+        # SQLite read it without creating ``-shm`` on a read-only filesystem.
+        query = "mode=ro" if any(path.exists() for path in sidecars) else (
+            "mode=ro&immutable=1"
+        )
+        return f"{self.db_path.resolve().as_uri()}?{query}"
 
     def __enter__(self) -> "GraphStore":
         return self
@@ -787,10 +873,28 @@ class GraphStore:
     def _invalidate_cache(self) -> None:
         """Invalidate the cached NetworkX graph after write operations."""
         with self._cache_lock:
+            self._cache_epoch += 1
             self._nxg_cache = None
+            self._bare_endpoint_context_cache = None
+
+    def shrink_memory(self, clear_nx_cache: bool = True) -> None:
+        """Release cached in-memory structures and shrink SQLite page cache."""
+        if clear_nx_cache:
+            self._invalidate_cache()
+        try:
+            self._conn.execute("PRAGMA shrink_memory")
+        except sqlite3.Error:
+            pass
+        release_os_memory()
 
     def close(self) -> None:
+        self._invalidate_cache()
+        try:
+            self._conn.execute("PRAGMA shrink_memory")
+        except sqlite3.Error:
+            pass
         self._conn.close()
+        release_os_memory()
 
     # --- Write operations ---
 
@@ -808,8 +912,10 @@ class GraphStore:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(qualified_name) DO UPDATE SET
                  kind=excluded.kind, name=excluded.name,
-                 file_path=excluded.file_path, line_start=excluded.line_start,
-                 line_end=excluded.line_end, language=excluded.language,
+                 file_path=excluded.file_path,
+                 line_start=excluded.line_start,
+                 line_end=excluded.line_end,
+                 language=excluded.language,
                  parent_name=excluded.parent_name, params=excluded.params,
                  return_type=excluded.return_type, modifiers=excluded.modifiers,
                  is_test=excluded.is_test, file_hash=excluded.file_hash,
@@ -831,6 +937,7 @@ class GraphStore:
         row = self._conn.execute(
             "SELECT id FROM nodes WHERE qualified_name = ?", (qualified,)
         ).fetchone()
+        self._invalidate_cache()
         return row["id"]
 
     def upsert_edge(self, edge: EdgeInfo) -> int:
@@ -855,6 +962,7 @@ class GraphStore:
                 " updated_at=? WHERE id=?",
                 (edge.line, extra, confidence, confidence_tier, now, existing["id"]),
             )
+            self._invalidate_cache()
             return existing["id"]
 
         self._conn.execute(
@@ -865,7 +973,9 @@ class GraphStore:
             (edge.kind, edge.source, edge.target, edge.file_path, edge.line, extra,
              confidence, confidence_tier, now),
         )
-        return self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        edge_id = self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self._invalidate_cache()
+        return edge_id
 
     def remove_file_data(self, file_path: str) -> None:
         """Remove all nodes and edges associated with a file."""
@@ -1014,6 +1124,24 @@ class GraphStore:
             raise
         self._invalidate_cache()
 
+    def store_file_edges(self, file_path: str, edges: list[EdgeInfo]) -> None:
+        """Atomically replace a file's edges and keep its node rows.
+
+        For a file whose bytes did not change. Its symbols are the same, and
+        flows and communities point at their node ids, so those ids must stay.
+        """
+        self._begin_immediate()
+        try:
+            self._conn.execute(
+                "DELETE FROM edges WHERE file_path = ?", (normalize_file_path(file_path),)
+            )
+            self._insert_edges(edges, time.time())
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._invalidate_cache()
+
     def _replace_file_data(
         self, file_path: str, nodes: list[NodeInfo], edges: list[EdgeInfo], fhash: str = ""
     ) -> None:
@@ -1061,8 +1189,10 @@ class GraphStore:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(qualified_name) DO UPDATE SET
                      kind=excluded.kind, name=excluded.name,
-                     file_path=excluded.file_path, line_start=excluded.line_start,
-                     line_end=excluded.line_end, language=excluded.language,
+                     file_path=excluded.file_path,
+                     line_start=excluded.line_start,
+                     line_end=excluded.line_end,
+                     language=excluded.language,
                      parent_name=excluded.parent_name, params=excluded.params,
                      return_type=excluded.return_type, modifiers=excluded.modifiers,
                      is_test=excluded.is_test, file_hash=excluded.file_hash,
@@ -1072,32 +1202,37 @@ class GraphStore:
                 """,
                 node_rows,
             )
-        if edges:
-            # upsert_edge() collapsed duplicate call sites (same kind, source,
-            # target, file, line) into a single row carrying the *last*
-            # extra/confidence values. Replicate that collapse in Python so a
-            # plain INSERT batch is safe — the file's previous rows were
-            # deleted above and an identical edge cannot come from another
-            # file (file_path is part of the identity).
-            edge_by_site: dict[tuple[str, str, str, str, int], tuple] = {}
-            for edge in edges:
-                extra_dict = edge.extra if edge.extra else {}
-                confidence = float(extra_dict.get("confidence", 1.0))
-                confidence_tier = str(extra_dict.get("confidence_tier", "EXTRACTED"))
-                extra = json.dumps(extra_dict)
-                site = (edge.kind, edge.source, edge.target, edge.file_path, edge.line)
-                edge_by_site[site] = (
-                    edge.kind, edge.source, edge.target, edge.file_path, edge.line,
-                    extra, confidence, confidence_tier, now,
-                )
-            self._conn.executemany(
-                """INSERT INTO edges
-                   (kind, source_qualified, target_qualified, file_path, line, extra,
-                    confidence, confidence_tier, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                list(edge_by_site.values()),
-            )
+        self._insert_edges(edges, now)
         self._invalidate_cache()
+
+    def _insert_edges(self, edges: list[EdgeInfo], now: float) -> None:
+        """Insert one file's edges; its previous edge rows are already deleted."""
+        if not edges:
+            return
+        # upsert_edge() collapsed duplicate call sites (same kind, source,
+        # target, file, line) into a single row carrying the *last*
+        # extra/confidence values. Replicate that collapse in Python so a
+        # plain INSERT batch is safe — the file's previous rows were
+        # deleted above and an identical edge cannot come from another
+        # file (file_path is part of the identity).
+        edge_by_site: dict[tuple[str, str, str, str, int], tuple] = {}
+        for edge in edges:
+            extra_dict = edge.extra if edge.extra else {}
+            confidence = float(extra_dict.get("confidence", 1.0))
+            confidence_tier = str(extra_dict.get("confidence_tier", "EXTRACTED"))
+            extra = json.dumps(extra_dict)
+            site = (edge.kind, edge.source, edge.target, edge.file_path, edge.line)
+            edge_by_site[site] = (
+                edge.kind, edge.source, edge.target, edge.file_path, edge.line,
+                extra, confidence, confidence_tier, now,
+            )
+        self._conn.executemany(
+            """INSERT INTO edges
+               (kind, source_qualified, target_qualified, file_path, line, extra,
+                confidence, confidence_tier, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            list(edge_by_site.values()),
+        )
 
     def set_metadata(self, key: str, value: str) -> None:
         self._conn.execute(
@@ -1142,10 +1277,12 @@ class GraphStore:
 
     def commit(self) -> None:
         self._conn.commit()
+        self._invalidate_cache()
 
     def rollback(self) -> None:
         """Rollback the current transaction."""
         self._conn.rollback()
+        self._invalidate_cache()
 
     # --- Read operations ---
 
@@ -1267,7 +1404,12 @@ class GraphStore:
             yield self._row_to_edge(row)
 
     def get_transitive_tests(
-        self, qualified_name: str, max_depth: int = 1, max_frontier: int | None = None,
+        self,
+        qualified_name: str,
+        max_depth: int = 1,
+        max_frontier: int | None = None,
+        *,
+        include_helper_routes: bool = True,
     ) -> list[dict]:
         """Find tests covering a node, including indirect (transitive) coverage.
 
@@ -1277,6 +1419,11 @@ class GraphStore:
         1. Direct: TESTED_BY edges originating at this node (+ bare-name fallback).
         2. Indirect: follow outgoing CALLS edges up to *max_depth* hops,
            then collect TESTED_BY edges on each callee.
+        3. Follow incoming CALLS through test helpers to actual Test nodes,
+           allowing *max_depth* helpers between the symbol and a test. Pass
+           ``include_helper_routes=False`` to leave this step out: a call path
+           is a pointer to a test, not a record of coverage, so risk scoring
+           must not count it.
 
         Returns a list of dicts with node fields plus ``indirect: bool``.
 
@@ -1463,7 +1610,79 @@ class GraphStore:
                             results.append(d)
             frontier = next_frontier
 
+        if max_depth > 0 and include_helper_routes:
+            for route in self._get_test_helper_routes(
+                input_qns, max_depth + 1, max_frontier, self.get_repo_root(),
+            ).values():
+                for test in route["tests"]:
+                    if test not in seen:
+                        seen.add(test)
+                        d = _node_dict(test, indirect=True)
+                        if d:
+                            results.append(d)
+
         return results
+
+    def _get_test_helper_routes(
+        self, seeds: list[str], max_depth: int, max_callers: int, repo_root: str | None,
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve CALLS paths through test helpers, never helper TESTED_BY edges.
+
+        Helpers are marked as test code after parsing, so they need not have
+        TESTED_BY edges. Only reaching a real Test declaration supplies evidence;
+        a fixture's is_test flag alone cannot vouch for production code.
+        """
+        from .parser import is_test_file
+
+        routes: dict[str, dict[str, Any]] = {}
+        frontier = {qn: {qn} for qn in seeds if "::" in qn}
+        expanded = {qn: set(origins) for qn, origins in frontier.items()}
+        for depth in range(1, max_depth + 1):
+            keys = sorted(frontier)
+            if not keys:
+                break
+            hubs: set[str] = set()
+            for start in range(0, len(keys), 450):
+                batch = keys[start:start + 450]
+                placeholders = ",".join("?" for _ in batch)
+                for row in self._conn.execute(  # nosec B608
+                    "SELECT target_qualified, COUNT(*) AS n FROM edges "
+                    f"WHERE kind = 'CALLS' AND target_qualified IN ({placeholders}) "
+                    "GROUP BY target_qualified", batch,
+                ).fetchall():
+                    if row["n"] > max_callers:
+                        hubs.add(row["target_qualified"])
+            keys = [key for key in keys if key not in hubs]
+            next_frontier: dict[str, set[str]] = {}
+            for start in range(0, len(keys), 450):
+                batch = keys[start:start + 450]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self._conn.execute(  # nosec B608
+                    "SELECT e.source_qualified, e.target_qualified, e.extra, "
+                    "n.kind, n.file_path, n.is_test FROM edges e "
+                    "JOIN nodes n ON n.qualified_name = e.source_qualified "
+                    f"WHERE e.kind = 'CALLS' AND e.target_qualified IN ({placeholders}) "
+                    "ORDER BY e.source_qualified, e.target_qualified", batch,
+                ).fetchall()
+                for row in rows:
+                    caller = row["source_qualified"]
+                    if "::" not in caller or _edge_extra_is_unresolved(row["extra"]):
+                        continue
+                    origins = frontier[row["target_qualified"]]
+                    fresh = origins - expanded.get(caller, set()) - {caller}
+                    if row["kind"] == "Test":
+                        for origin in sorted(fresh):
+                            route = routes.setdefault(origin, {
+                                "via": caller, "depth": depth, "tests": [],
+                            })
+                            if caller not in route["tests"]:
+                                route["tests"].append(caller)
+                    elif row["is_test"] or is_test_file(row["file_path"], repo_root):
+                        next_frontier.setdefault(caller, set()).update(fresh)
+            for caller, origins in next_frontier.items():
+                expanded.setdefault(caller, set()).update(origins)
+            frontier = next_frontier
+        return routes
 
     def get_directly_tested(self, qualified_names: Iterable[str]) -> set[str]:
         """Which of *qualified_names* carry a TESTED_BY edge of their own.
@@ -1493,9 +1712,8 @@ class GraphStore:
     ) -> dict[str, dict[str, Any]]:
         """Find, for each input symbol, a tested *caller* that reaches it.
 
-        This is the opposite direction from :meth:`get_transitive_tests`, which
-        walks *outgoing* CALLS to ask "do the things this symbol calls have
-        tests?". Here the walk is *upwards* over incoming CALLS edges: a
+        This walks *upwards* over incoming CALLS edges, unlike the outgoing
+        callee traversal in :meth:`get_transitive_tests`: a
         private helper that no test names directly is still run by the tests of
         the public function that calls it, and reporting it as flatly
         "untested" is a false alarm the author cannot act on (#1047).
@@ -1533,7 +1751,8 @@ class GraphStore:
                 test files. Such a caller's TESTED_BY edges point at other
                 symbols in its own test file, so crediting a production symbol
                 through one would let a test fixture vouch for the code it
-                sets up. Defaults to the graph's recorded root.
+                sets up. Resolved CALLS paths through helpers to actual Test
+                nodes are accepted. Defaults to the graph's recorded root.
 
         Returns:
             ``{qualified_name: {"via", "depth", "tests"}}`` holding only the
@@ -1547,15 +1766,17 @@ class GraphStore:
         if repo_root is None:
             repo_root = self.get_repo_root()
         seeds = [qn for qn in dict.fromkeys(qualified_names) if qn]
-        routes: dict[str, dict[str, Any]] = {}
         if not seeds or max_depth < 1:
-            return routes
+            return {}
+        routes = self._get_test_helper_routes(seeds, max_depth, max_callers_per_node, repo_root)
+        for route in routes.values():
+            route["tests"] = route["tests"][:3]
 
         # node -> the seeds whose route currently passes through it. The walk
         # is level-synchronous and batched over every seed at once: one CALLS
         # query and one TESTED_BY query per hop, rather than a BFS per symbol.
         # On a 248-symbol delta that is 4 queries instead of several hundred.
-        frontier: dict[str, set[str]] = {qn: {qn} for qn in seeds}
+        frontier: dict[str, set[str]] = {qn: {qn} for qn in seeds if qn not in routes}
         # node -> seeds already expanded through it, so a call cycle
         # terminates instead of re-walking the same edges each hop.
         expanded: dict[str, set[str]] = {qn: set(origins) for qn, origins in frontier.items()}
@@ -1613,6 +1834,8 @@ class GraphStore:
             # production symbol through one lets a fixture vouch for the code
             # it sets up -- 20% of this graph's TESTED_BY edges start at a
             # test-file symbol, so the laundering is not hypothetical.
+            from .parser import is_test_file
+
             caller_names = sorted(callers)
             for start in range(0, len(caller_names), 450):
                 batch = caller_names[start:start + 450]
@@ -1754,9 +1977,13 @@ class GraphStore:
             class_name = edge_extra.get("receiver_class")
             if not isinstance(class_name, str) or not class_name:
                 return []
+            class_file = edge_extra.get("receiver_class_file")
+            if class_file is not None and not isinstance(class_file, str):
+                return []
             return [
                 candidate for candidate in candidates
                 if parent_lookup.get(candidate[0]) == class_name
+                and (not class_file or candidate[1] == class_file)
             ]
         return []
 
@@ -1831,7 +2058,8 @@ class GraphStore:
         try:
             cursor = self._conn.execute(
                 "UPDATE edges SET target_resolution = "  # noqa: S608
-                f"{TARGET_RESOLUTION_EXPR} WHERE kind IN ({placeholders})",
+                f"{TARGET_RESOLUTION_EXPR} WHERE kind IN ({placeholders}) "
+                f"AND target_resolution IS NOT ({TARGET_RESOLUTION_EXPR})",
                 TARGET_RESOLUTION_KINDS,
             )
             self._conn.commit()
@@ -2114,6 +2342,124 @@ class GraphStore:
                     members.setdefault(directory, set()).add(file_path)
         return members
 
+    def _get_bare_endpoint_context(
+        self, conn: sqlite3.Connection
+    ) -> tuple[
+        dict[str, list[tuple[str, str]]],
+        dict[str, str | None],
+        dict[str, set[str]],
+        dict[str, set[str]],
+    ]:
+        cached = getattr(self, "_bare_endpoint_context_cache", None)
+        if cached is not None:
+            return cached
+        epoch = self._cache_epoch
+
+        # bare_name -> [(qualified_name, defining_file)]
+        node_lookup: dict[str, list[tuple[str, str]]] = {}
+        # qualified_name -> owning class, so a receiver known to be an
+        # instance of one class cannot be answered by another class's method.
+        parent_lookup: dict[str, str | None] = {}
+        for row in conn.execute(
+            "SELECT name, qualified_name, file_path, parent_name FROM nodes "
+            "WHERE kind IN ('Function', 'Test', 'Class')"
+        ).fetchall():
+            node_lookup.setdefault(row["name"], []).append(
+                (row["qualified_name"], row["file_path"]),
+            )
+            parent_lookup[row["qualified_name"]] = row["parent_name"]
+
+        # call-site file -> explicitly imported files
+        import_targets: dict[str, set[str]] = {}
+        ambiguous_import_targets: dict[str, set[str]] = {}
+        scoped_dirs: dict[str, str] = {}
+        for row in conn.execute(
+            "SELECT DISTINCT file_path, target_qualified, extra FROM edges "
+            "WHERE kind = 'IMPORTS_FROM'"
+        ).fetchall():
+            target = row["target_qualified"]
+            target_file = target.split("::", 1)[0] if "::" in target else target
+            import_targets.setdefault(row["file_path"], set()).add(target_file)
+            raw_extra = row["extra"]
+            if not raw_extra or raw_extra == "{}":
+                continue
+            scope = _edge_import_scope(raw_extra)
+            if scope is not None:
+                scoped_dirs[target] = scope
+            if "ambiguous" in raw_extra:
+                try:
+                    import_extra = json.loads(raw_extra)
+                except (TypeError, json.JSONDecodeError):
+                    import_extra = {}
+                if (
+                    isinstance(import_extra, dict)
+                    and import_extra.get("import_resolution") == "ambiguous"
+                    and isinstance(import_extra.get("import_candidates"), list)
+                ):
+                    ambiguous_import_targets.setdefault(
+                        row["file_path"], set(),
+                    ).update(
+                        candidate
+                        for candidate in import_extra["import_candidates"]
+                        if isinstance(candidate, str)
+                    )
+
+        namespace_files: dict[str, set[str]] = {}
+        for row in conn.execute(
+            "SELECT file_path, extra FROM nodes "
+            'WHERE kind = \'File\' AND extra LIKE \'%"csharp_namespaces"%\''
+        ).fetchall():
+            try:
+                node_extra = json.loads(row["extra"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(node_extra, dict):
+                continue
+            declared = node_extra.get("csharp_namespaces")
+            if not isinstance(declared, list):
+                continue
+            for ns in declared:
+                if isinstance(ns, str) and ns:
+                    namespace_files.setdefault(ns, set()).add(
+                        row["file_path"],
+                    )
+        if namespace_files:
+            for imported in import_targets.values():
+                expanded: set[str] = set()
+                for target in imported:
+                    expanded |= namespace_files.get(target, set())
+                imported |= expanded
+
+        if scoped_dirs:
+            members = self._directory_member_files(conn, scoped_dirs)
+            for imported in import_targets.values():
+                grown: set[str] = set()
+                for target in imported:
+                    grown |= members.get(target, set())
+                imported |= grown
+
+        module_files = self._python_module_file_index(conn)
+        if module_files:
+            for imported in import_targets.values():
+                expanded = set()
+                for target in imported:
+                    resolved_file = module_files.get(target)
+                    if resolved_file:
+                        expanded.add(resolved_file)
+                imported |= expanded
+
+        result = (
+            node_lookup,
+            parent_lookup,
+            import_targets,
+            ambiguous_import_targets,
+        )
+        with self._cache_lock:
+            # Publish only if no write invalidated the context meanwhile.
+            if self._cache_epoch == epoch:
+                self._bare_endpoint_context_cache = result
+        return result
+
     def _resolve_bare_endpoints(self, kind: str, endpoint: str) -> int:
         """Resolve a bare edge endpoint only when one candidate has evidence."""
         if endpoint == "target_qualified":
@@ -2156,151 +2502,70 @@ class GraphStore:
         if not has_bare:
             return 0
 
+        (
+            node_lookup,
+            parent_lookup,
+            import_targets,
+            ambiguous_import_targets,
+        ) = self._get_bare_endpoint_context(conn)
+
         # Stream candidate rows lazily instead of materialising the full set
         # into memory (millions of rows on large graphs, issue #721).
         bare_edges = conn.execute(select_sql, (kind,))
-
-        # bare_name -> [(qualified_name, defining_file)]
-        node_lookup: dict[str, list[tuple[str, str]]] = {}
-        # qualified_name -> owning class, so a receiver known to be an
-        # instance of one class cannot be answered by another class's method.
-        parent_lookup: dict[str, str | None] = {}
-        for row in conn.execute(
-            "SELECT name, qualified_name, file_path, parent_name FROM nodes "
-            "WHERE kind IN ('Function', 'Test', 'Class')"
-        ).fetchall():
-            node_lookup.setdefault(row["name"], []).append(
-                (row["qualified_name"], row["file_path"]),
-            )
-            parent_lookup[row["qualified_name"]] = row["parent_name"]
-
-        # call-site file -> explicitly imported files
-        import_targets: dict[str, set[str]] = {}
-        # Python's repository-suffix resolver keeps a raw import when multiple
-        # indexed modules match and records the candidate files in edge metadata.
-        # Carry that evidence into bare CALLS / TESTED_BY endpoints so a graph
-        # first built in the ambiguous state cannot fall back to a name-only
-        # caller match for every candidate.
-        ambiguous_import_targets: dict[str, set[str]] = {}
-        # Directory-scoped targets: a Go import names a package, not a file.
-        # The edge stays one row; the member files are expanded here, once
-        # per post-processing pass, rather than stored one edge per member.
-        scoped_dirs: dict[str, str] = {}
-        for row in conn.execute(
-            "SELECT DISTINCT file_path, target_qualified, extra FROM edges "
-            "WHERE kind = 'IMPORTS_FROM'"
-        ).fetchall():
-            target = row["target_qualified"]
-            target_file = target.split("::", 1)[0] if "::" in target else target
-            import_targets.setdefault(row["file_path"], set()).add(target_file)
-            scope = _edge_import_scope(row["extra"])
-            if scope is not None:
-                scoped_dirs[target] = scope
-            try:
-                import_extra = json.loads(row["extra"] or "{}")
-            except (TypeError, json.JSONDecodeError):
-                import_extra = {}
-            if (
-                isinstance(import_extra, dict)
-                and import_extra.get("import_resolution") == "ambiguous"
-                and isinstance(import_extra.get("import_candidates"), list)
-            ):
-                ambiguous_import_targets.setdefault(
-                    row["file_path"], set(),
-                ).update(
-                    candidate
-                    for candidate in import_extra["import_candidates"]
-                    if isinstance(candidate, str)
-                )
-
-        # C# `using X.Y;` directives store IMPORTS_FROM targets as raw
-        # namespace strings rather than file paths, so the path-keyed
-        # evidence above never matches a candidate's defining file. Map
-        # declared namespaces back to the files declaring them and add
-        # those files as import evidence. See: #310, #792
-        namespace_files: dict[str, set[str]] = {}
-        for row in conn.execute(
-            "SELECT file_path, extra FROM nodes "
-            "WHERE kind = 'File' AND extra LIKE '%\"csharp_namespaces\"%'"
-        ).fetchall():
-            try:
-                node_extra = json.loads(row["extra"] or "{}")
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if not isinstance(node_extra, dict):
-                continue
-            declared = node_extra.get("csharp_namespaces")
-            if not isinstance(declared, list):
-                continue
-            for ns in declared:
-                if isinstance(ns, str) and ns:
-                    namespace_files.setdefault(ns, set()).add(
-                        row["file_path"],
-                    )
-        if namespace_files:
-            for imported in import_targets.values():
-                expanded: set[str] = set()
-                for target in imported:
-                    expanded |= namespace_files.get(target, set())
-                imported |= expanded
-
-        if scoped_dirs:
-            members = self._directory_member_files(conn, scoped_dirs)
-            for imported in import_targets.values():
-                grown: set[str] = set()
-                for target in imported:
-                    grown |= members.get(target, set())
-                imported |= grown
-
-        # Python imports the repository-suffix resolver could not map to a file
-        # keep their raw dotted module as the IMPORTS_FROM target — the standard
-        # `src` layout, or framework-mediated packages such as Odoo's
-        # `odoo.addons.*`. Path-keyed evidence can never match a dotted module,
-        # so map each dotted module back to the file that could define it. Only
-        # an unambiguous match counts: a module answered by two indexed files is
-        # no more evidence than a bare name. See: #903
-        module_files = self._python_module_file_index(conn)
-        if module_files:
-            for imported in import_targets.values():
-                expanded = set()
-                for target in imported:
-                    resolved_file = module_files.get(target)
-                    if resolved_file:
-                        expanded.add(resolved_file)
-                imported |= expanded
 
         resolved = 0
         # Collect every mutation, then apply them in one transaction at the
         # end of the loop (see below).
         updates: list[tuple[str, str, int]] = []
         for edge in bare_edges:
-            try:
-                edge_extra = json.loads(edge["extra"] or "{}")
-            except (TypeError, json.JSONDecodeError):
+            raw_extra = edge["extra"]
+            if not raw_extra or raw_extra == "{}":
+                bare_name = edge[endpoint]
+                if not isinstance(bare_name, str):
+                    continue
+                candidates = node_lookup.get(bare_name)
+                if not candidates:
+                    continue
                 edge_extra = {}
-            if not isinstance(edge_extra, dict):
-                edge_extra = {}
-            if raw_key not in edge_extra and (
-                "ambiguous_targets" in edge_extra
-                or "unresolved_targets" in edge_extra
-            ):
-                continue
-
-            bare_name = edge_extra.get(raw_key, edge[endpoint])
-            if not isinstance(bare_name, str):
-                continue
-            candidates = node_lookup.get(bare_name, [])
-            if "receiver_binding" in edge_extra:
-                candidates = self._receiver_backed_candidates(
-                    candidates, edge_extra, parent_lookup,
-                )
+            else:
+                try:
+                    edge_extra = json.loads(raw_extra)
+                except (TypeError, json.JSONDecodeError):
+                    edge_extra = {}
+                if not isinstance(edge_extra, dict):
+                    edge_extra = {}
+                if raw_key not in edge_extra and (
+                    "ambiguous_targets" in edge_extra
+                    or "unresolved_targets" in edge_extra
+                ):
+                    continue
+                bare_name = edge_extra.get(raw_key, edge[endpoint])
+                if not isinstance(bare_name, str):
+                    continue
+                candidates = node_lookup.get(bare_name, [])
+                if "receiver_binding" in edge_extra:
+                    candidates = self._receiver_backed_candidates(
+                        candidates, edge_extra, parent_lookup,
+                    )
 
             context_file = edge["file_path"]
             imported_files = import_targets.get(context_file, set())
+            # A module receiver names its file outright; when that module
+            # only re-exports the name, the parser stamps the defining file,
+            # which the call site never imports itself.
+            receiver_file = (
+                edge_extra.get("receiver_module")
+                if edge_extra.get("receiver_binding") == "module"
+                else None
+            )
+            receiver_class_file = edge_extra.get("receiver_class_file")
             supported = [
                 qualified
                 for qualified, candidate_file in candidates
-                if candidate_file == context_file or candidate_file in imported_files
+                if candidate_file == context_file
+                or candidate_file in imported_files
+                or candidate_file == receiver_file
+                or candidate_file == receiver_class_file
             ]
             ambiguous_files = ambiguous_import_targets.get(context_file, set())
             ambiguity_supported = [
@@ -2367,12 +2632,12 @@ class GraphStore:
                     ),
                 })
 
-            serialized_extra = json.dumps(desired_extra, sort_keys=True)
             if (
                 edge[endpoint] == desired_endpoint
                 and edge_extra == desired_extra
             ):
                 continue
+            serialized_extra = json.dumps(desired_extra, sort_keys=True)
             updates.append((desired_endpoint, serialized_extra, edge["id"]))
             if len(supported) == 1 and edge[endpoint] != desired_endpoint:
                 resolved += 1
@@ -2733,14 +2998,20 @@ class GraphStore:
                 f"INSERT OR IGNORE INTO _impact_seed_names (name) VALUES {placeholders}",
                 batch,
             )
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM edges "  # noqa: S608
-            "JOIN _impact_seed_names s ON s.name = edges.target_qualified "
-            "WHERE edges.kind IN ('CALLS', 'REFERENCES') "
-            f"AND COALESCE(edges.target_resolution, {TARGET_RESOLUTION_EXPR}) "
-            "= 'unresolved'",
-        ).fetchone()
-        return int(row[0]) if row else 0
+        try:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM edges "  # noqa: S608
+                "JOIN _impact_seed_names s ON s.name = edges.target_qualified "
+                "WHERE edges.kind IN ('CALLS', 'REFERENCES') "
+                f"AND COALESCE(edges.target_resolution, {TARGET_RESOLUTION_EXPR}) "
+                "= 'unresolved'",
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            try:
+                self._conn.execute("DELETE FROM _impact_seed_names")
+            except sqlite3.Error:
+                pass
 
     def get_impact_radius(
         self,
@@ -2749,7 +3020,7 @@ class GraphStore:
         max_nodes: int = MAX_IMPACT_NODES,
         resolution: str = "all",
     ) -> dict[str, Any]:
-        """Find dependents and tests impacted by changed files within depth N.
+        """Calculate the impact radius (dependents and tests) of changed files within depth N.
 
         Delegates to ``get_impact_radius_sql()`` by default (faster for
         large graphs).  Set ``CRG_BFS_ENGINE=networkx`` to use the legacy
@@ -2902,10 +3173,14 @@ class GraphStore:
         candidate_params = (
             IMPACT_DEFAULT_EDGE_WEIGHT,
             IMPACT_DEPTH_DECAY,
+            _IMPACT_AOP_EXTRA_LIKE,
+            IMPACT_DIRECTION_OUTGOING,
             IMPACT_DEFAULT_EDGE_DIRECTION,
             IMPACT_DIRECTION_OUTGOING,
             IMPACT_DEFAULT_EDGE_WEIGHT,
             IMPACT_DEPTH_DECAY,
+            _IMPACT_AOP_EXTRA_LIKE,
+            IMPACT_DIRECTION_OUTGOING,
             IMPACT_DEFAULT_EDGE_DIRECTION,
             IMPACT_DIRECTION_INCOMING,
             IMPACT_DEFAULT_EDGE_WEIGHT,
@@ -2943,29 +3218,43 @@ class GraphStore:
         # Fetch one sentinel beyond the public cap. Ghost endpoints remain in
         # the frontier as bridges but cannot consume a result slot because the
         # final selection joins the canonical nodes table.
-        rows = self._conn.execute(
-            "SELECT b.node_qn, b.score "
-            "FROM _impact_best b "
-            "JOIN nodes n ON n.qualified_name = b.node_qn "
-            "LEFT JOIN _impact_seeds s ON s.qn = b.node_qn "
-            "WHERE s.qn IS NULL "
-            "AND n.extra NOT LIKE '%\"verilog_kind\"%' "
-            "ORDER BY b.score DESC, b.node_qn "
-            "LIMIT ?",
-            (max_nodes + 1,),
-        ).fetchall()
-        truncated = len(rows) > max_nodes
-        if truncated:
-            total_impacted = self._conn.execute(
-                "SELECT COUNT(*) "
+        try:
+            rows = self._conn.execute(
+                "SELECT b.node_qn, b.score "
                 "FROM _impact_best b "
                 "JOIN nodes n ON n.qualified_name = b.node_qn "
                 "LEFT JOIN _impact_seeds s ON s.qn = b.node_qn "
                 "WHERE s.qn IS NULL "
-                "AND n.extra NOT LIKE '%\"verilog_kind\"%'"
-            ).fetchone()[0]
-        else:
-            total_impacted = len(rows)
+                "AND n.extra NOT LIKE '%\"verilog_kind\"%' "
+                "ORDER BY b.score DESC, b.node_qn "
+                "LIMIT ?",
+                (max_nodes + 1,),
+            ).fetchall()
+            truncated = len(rows) > max_nodes
+            if truncated:
+                total_impacted = self._conn.execute(
+                    "SELECT COUNT(*) "
+                    "FROM _impact_best b "
+                    "JOIN nodes n ON n.qualified_name = b.node_qn "
+                    "LEFT JOIN _impact_seeds s ON s.qn = b.node_qn "
+                    "WHERE s.qn IS NULL "
+                    "AND n.extra NOT LIKE '%\"verilog_kind\"%'"
+                ).fetchone()[0]
+            else:
+                total_impacted = len(rows)
+        finally:
+            for _tbl in (
+                "_impact_seeds",
+                "_impact_policies",
+                "_impact_best",
+                "_impact_frontier",
+                "_impact_next",
+                "_impact_frontier_dirs",
+            ):
+                try:
+                    self._conn.execute(f"DELETE FROM {_tbl}")  # nosec B608
+                except sqlite3.Error:
+                    pass
         kept_rows = rows[:max_nodes]
         score_by_qn = {row[0]: float(row[1]) for row in kept_rows}
 
@@ -3342,11 +3631,22 @@ class GraphStore:
         return result
 
     def get_files_matching(self, pattern: str) -> list[str]:
-        """Return distinct ``file_path`` values matching a LIKE suffix."""
+        """Return distinct ``file_path`` values ending with *pattern*.
+
+        Paths are normalized to POSIX separators first. ``%`` and ``_`` in
+        *pattern* are treated as literal characters, not SQL ``LIKE``
+        wildcards.
+        """
+        normalized = normalize_file_path(pattern)
+        escaped = (
+            normalized.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
         rows = self._conn.execute(
             "SELECT DISTINCT file_path FROM nodes "
-            "WHERE file_path LIKE ?",
-            (f"%{normalize_file_path(pattern)}",),
+            "WHERE file_path LIKE ? ESCAPE '\\'",
+            (f"%{escaped}",),
         ).fetchall()
         return [r["file_path"] for r in rows]
 
@@ -3652,6 +3952,8 @@ class GraphStore:
 
     def _build_networkx_graph(self) -> nx.DiGraph:
         """Build a directed graph with impact weights for both policies."""
+        import networkx as nx
+
         with self._cache_lock:
             if self._nxg_cache is not None:
                 return self._nxg_cache
@@ -3700,9 +4002,15 @@ class GraphStore:
                 if candidate_weight > existing_weight:
                     data["kind"] = kind
 
-                direction = IMPACT_EDGE_DIRECTIONS.get(
-                    kind, IMPACT_DEFAULT_EDGE_DIRECTION,
-                )
+                # AOP-derived CALLS edges always propagate source->target
+                # (advice -> target), overriding CALLS' registered direction
+                # — see the matching comment in get_impact_radius_sql.
+                if '"aop_resolved"' in (r["extra"] or ""):
+                    direction = IMPACT_DIRECTION_OUTGOING
+                else:
+                    direction = IMPACT_EDGE_DIRECTIONS.get(
+                        kind, IMPACT_DEFAULT_EDGE_DIRECTION,
+                    )
                 if direction != IMPACT_DIRECTION_NONE:
                     weight_key = f"impact_{direction}_weight"
                     data[weight_key] = max(
@@ -3720,6 +4028,7 @@ class GraphStore:
         return f"{node.file_path}::{identity_name}"
 
     def _row_to_node(self, row: sqlite3.Row) -> GraphNode:
+        raw_extra = row["extra"]
         return GraphNode(
             id=row["id"],
             kind=row["kind"],
@@ -3734,14 +4043,23 @@ class GraphStore:
             return_type=row["return_type"],
             is_test=bool(row["is_test"]),
             file_hash=row["file_hash"],
-            extra=json.loads(row["extra"]) if row["extra"] else {},
+            extra=(
+                json.loads(raw_extra)
+                if raw_extra and raw_extra != "{}"
+                else {}
+            ),
         )
 
     def _row_to_edge(self, row: sqlite3.Row) -> GraphEdge:
-        extra = json.loads(row["extra"]) if row["extra"] else {}
-        confidence = row["confidence"] if "confidence" in row.keys() else 1.0
-        confidence_tier = row["confidence_tier"] if "confidence_tier" in row.keys() else "EXTRACTED"
+        raw_extra = row["extra"]
+        extra = (
+            json.loads(raw_extra)
+            if raw_extra and raw_extra != "{}"
+            else {}
+        )
         keys = row.keys()
+        confidence = row["confidence"] if "confidence" in keys else 1.0
+        confidence_tier = row["confidence_tier"] if "confidence_tier" in keys else "EXTRACTED"
         target_resolution = (
             row["target_resolution"] if "target_resolution" in keys else None
         )
@@ -3777,7 +4095,7 @@ def _sanitize_name(s: str, max_len: int = 256) -> str:
 
 
 def node_to_dict(n: GraphNode) -> dict:
-    return {
+    result = {
         "id": n.id, "kind": n.kind, "name": _sanitize_name(n.name),
         "qualified_name": _sanitize_name(n.qualified_name), "file_path": n.file_path,
         "line_start": n.line_start, "line_end": n.line_end,
@@ -3785,6 +4103,86 @@ def node_to_dict(n: GraphNode) -> dict:
         "parent_name": _sanitize_name(n.parent_name) if n.parent_name else n.parent_name,
         "is_test": n.is_test,
     }
+    if n.kind == "YamlPath":
+        yaml_metadata: dict[str, Any] = {}
+        for key in (
+            "schema_path",
+            "example_path",
+            "value_type",
+        ):
+            value = n.extra.get(key)
+            if isinstance(value, str):
+                yaml_metadata[key] = _sanitize_name(value)
+        for key in (
+            "document_index",
+            "occurrence_count",
+            "duplicate_key_occurrence_count",
+            "duplicate_group_count",
+        ):
+            value = n.extra.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                yaml_metadata[key] = value
+        for key in (
+            "duplicate_key",
+            "duplicate_groups_truncated",
+            "is_alias",
+            "anchor_definition",
+            "yaml_merge",
+            "lines_truncated",
+        ):
+            value = n.extra.get(key)
+            if isinstance(value, bool):
+                yaml_metadata[key] = value
+        value_types = n.extra.get("value_types")
+        if isinstance(value_types, list):
+            yaml_metadata["value_types"] = [
+                _sanitize_name(value)
+                for value in value_types[:20]
+                if isinstance(value, str)
+            ]
+        line_samples = n.extra.get("line_samples")
+        if isinstance(line_samples, list):
+            yaml_metadata["line_samples"] = [
+                line for line in line_samples[:20]
+                if isinstance(line, int) and not isinstance(line, bool)
+            ]
+            occurrence_count = n.extra.get("occurrence_count", len(line_samples))
+            if isinstance(occurrence_count, int) and not isinstance(occurrence_count, bool):
+                yaml_metadata["line_samples_omitted"] = max(
+                    0,
+                    occurrence_count - len(yaml_metadata["line_samples"]),
+                )
+        result["yaml"] = yaml_metadata
+    elif n.kind == "File" and "values_indexed" in n.extra:
+        file_yaml_metadata: dict[str, Any] = {
+            "document_count": n.extra.get("yaml_document_count", 0),
+            "duplicate_key_count": n.extra.get("yaml_duplicate_key_count", 0),
+            "unsupported_key_count": n.extra.get("yaml_unsupported_key_count", 0),
+            "truncated": bool(n.extra.get("yaml_truncated")),
+            "values_indexed": False,
+        }
+        duplicate_keys = n.extra.get("yaml_duplicate_keys")
+        if isinstance(duplicate_keys, list):
+            safe_duplicate_keys: list[dict[str, Any]] = []
+            for item in duplicate_keys[:100]:
+                if not isinstance(item, dict):
+                    continue
+                item_lines = item.get("line_samples")
+                if not isinstance(item_lines, list):
+                    item_lines = []
+                safe_duplicate_keys.append({
+                    "document_index": item.get("document_index"),
+                    "path": _sanitize_name(str(item.get("path", ""))),
+                    "occurrence_count": item.get("occurrence_count"),
+                    "line_samples": [
+                        line for line in item_lines[:20]
+                        if isinstance(line, int) and not isinstance(line, bool)
+                    ],
+                    "lines_truncated": bool(item.get("lines_truncated")),
+                })
+            file_yaml_metadata["duplicate_keys"] = safe_duplicate_keys
+        result["yaml"] = file_yaml_metadata
+    return result
 
 
 def edge_to_dict(e: GraphEdge) -> dict:
@@ -3818,3 +4216,18 @@ def edge_to_dict(e: GraphEdge) -> dict:
                 or count > len(result[key])
             )
     return result
+
+
+def __getattr__(name: str) -> Any:
+    if name in ("EdgeInfo", "NodeInfo", "is_test_file"):
+        from . import parser as _parser
+
+        val = getattr(_parser, name)
+        globals()[name] = val
+        return val
+    if name == "nx":
+        import networkx as _nx
+
+        globals()["nx"] = _nx
+        return _nx
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
